@@ -221,6 +221,137 @@ func (self *LauncherTestSuite) TestScheduleUnknownClientRefused() {
 	assert.True(self.T(), utils.IsNotFound(err))
 }
 
+// A flow created after the client's flow list has been read must still be
+// readable. The flow cache is keyed by client id and holds a point in time
+// snapshot of that client's flows, so the new flow is absent from it.
+func (self *LauncherTestSuite) TestGetFlowDetailsForFlowCreatedAfterCacheWarmed() {
+	// The server pseudo client and a real agent are scheduled through
+	// different branches, so both are covered.
+	self.assertFlowReadableAfterCacheWarmed(
+		"server", "F.serverwarm", "F.serverlate")
+	self.assertFlowReadableAfterCacheWarmed(
+		"C.cachewarm", "F.agentwarm", "F.agentlate")
+}
+
+// The datastore fallback must work even when nothing invalidates the cache.
+// WriteFlow stores the record without rebuilding the index or purging the
+// snapshot, so the read can only succeed by querying the datastore.
+func (self *LauncherTestSuite) TestLoadCollectionContextFallsBackToDatastore() {
+	config_obj := self.ConfigObj.VeloConf()
+	client_id := "C.fallback"
+	flow_id := "F.datastoreonly"
+
+	launcher, err := services.GetLauncher(config_obj)
+	assert.NoError(self.T(), err)
+
+	self.warmFlowCache(config_obj, client_id, "F.fallbackwarm")
+
+	err = launcher.Storage().WriteFlow(self.Ctx, config_obj,
+		&flows_proto.ArtifactCollectorContext{
+			ClientId:      client_id,
+			SessionId:     flow_id,
+			State:         flows_proto.ArtifactCollectorContext_RUNNING,
+			TotalRequests: 1,
+		}, utils.SyncCompleter)
+	assert.NoError(self.T(), err)
+
+	err = cvelo_services.FlushBulkIndexer()
+	assert.NoError(self.T(), err)
+
+	collection_context, err := launcher.Storage().LoadCollectionContext(
+		self.Ctx, config_obj, client_id, flow_id)
+	assert.NoError(self.T(), err)
+	assert.NotNil(self.T(), collection_context)
+	assert.Equal(self.T(), flow_id, collection_context.SessionId)
+}
+
+// A flow that exists nowhere must still be reported as a not found error,
+// because that is what maps to a 404 rather than a 503.
+func (self *LauncherTestSuite) TestLoadCollectionContextUnknownFlowIsNotFound() {
+	config_obj := self.ConfigObj.VeloConf()
+
+	launcher, err := services.GetLauncher(config_obj)
+	assert.NoError(self.T(), err)
+
+	_, err = launcher.Storage().LoadCollectionContext(
+		self.Ctx, config_obj, "C.noflows", "F.doesnotexist")
+	assert.Error(self.T(), err)
+	assert.True(self.T(), utils.IsNotFound(err))
+}
+
+func (self *LauncherTestSuite) assertFlowReadableAfterCacheWarmed(
+	client_id, first_flow_id, second_flow_id string) {
+
+	config_obj := self.ConfigObj.VeloConf()
+
+	launcher, err := services.GetLauncher(config_obj)
+	assert.NoError(self.T(), err)
+
+	// Populates the snapshot, which then holds the first flow but not the second.
+	self.warmFlowCache(config_obj, client_id, first_flow_id)
+
+	closer := utils.SetFlowIdForTests(second_flow_id)
+	defer closer()
+
+	flow_id, err := launcher.ScheduleArtifactCollection(
+		self.Ctx, config_obj, acl_managers.NullACLManager{},
+		self.loadTestArtifact(config_obj),
+		&flows_proto.ArtifactCollectorArgs{
+			ClientId:  client_id,
+			Artifacts: []string{"TestArtifact"},
+		}, nil)
+	assert.NoError(self.T(), err)
+	assert.Equal(self.T(), second_flow_id, flow_id)
+
+	err = cvelo_services.FlushBulkIndexer()
+	assert.NoError(self.T(), err)
+
+	details, err := launcher.GetFlowDetails(self.Ctx, config_obj,
+		services.GetFlowOptions{}, client_id, flow_id)
+	assert.NoError(self.T(), err)
+	assert.NotNil(self.T(), details.Context)
+	assert.Equal(self.T(), flow_id, details.Context.SessionId)
+}
+
+// Schedule one flow for the client and read the flow list, which is what
+// populates the client keyed cache entry.
+func (self *LauncherTestSuite) warmFlowCache(
+	config_obj *config_proto.Config, client_id, flow_id string) {
+
+	launcher, err := services.GetLauncher(config_obj)
+	assert.NoError(self.T(), err)
+
+	if client_id != "server" {
+		self.seedClient(config_obj, client_id)
+	}
+
+	closer := utils.SetFlowIdForTests(flow_id)
+	defer closer()
+
+	_, err = launcher.ScheduleArtifactCollection(
+		self.Ctx, config_obj, acl_managers.NullACLManager{},
+		self.loadTestArtifact(config_obj),
+		&flows_proto.ArtifactCollectorArgs{
+			ClientId:  client_id,
+			Artifacts: []string{"TestArtifact"},
+		}, nil)
+	assert.NoError(self.T(), err)
+
+	err = cvelo_services.FlushBulkIndexer()
+	assert.NoError(self.T(), err)
+
+	vtesting.WaitUntil(5*time.Second, self.T(), func() bool {
+		flows, _ := launcher.GetFlows(self.Ctx, config_obj,
+			client_id, result_sets.ResultSetOptions{}, 0, 100)
+		return len(flows.Items) > 0
+	})
+
+	flows, err := launcher.GetFlows(self.Ctx, config_obj,
+		client_id, result_sets.ResultSetOptions{}, 0, 100)
+	assert.NoError(self.T(), err)
+	assert.True(self.T(), len(flows.Items) > 0)
+}
+
 func (self *LauncherTestSuite) loadTestArtifact(
 	config_obj *config_proto.Config) services.Repository {
 
