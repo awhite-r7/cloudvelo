@@ -18,7 +18,7 @@ jobs:
     - name: Install Opensearch
       uses: ankane/setup-opensearch@v1
       with:
-        opensearch-version: 3
+        opensearch-version: 2.19.6
 
     - name: Start LocalStack
       env:
@@ -40,11 +40,17 @@ jobs:
           # Make sure to pull the latest version of the image
           docker pull localstack/localstack:2.2.0
 
+          # The CLI starts the image by its bare name, so it runs :latest
+          # rather than the :2.2.0 just pulled. Point :latest at the pulled
+          # image so the container matches the pinned CLI instead of being
+          # whatever :latest happens to be today.
+          docker tag localstack/localstack:2.2.0 localstack/localstack:latest
+
           # Start LocalStack in the background
           localstack start -d
-          # Wait 30 seconds for the LocalStack container to become ready before timing out
+          # Wait for the LocalStack container to become ready before timing out
           echo "Waiting for LocalStack startup..."
-          localstack wait -t 30
+          localstack wait -t 120
           echo "Startup complete"
     - name: Initialize localstack
       run: |
@@ -61,11 +67,12 @@ jobs:
       shell: bash
       run: |
         mkdir -p artifact_output/
-        go test -v ./vql/uploads/ ./foreman/ ./ingestion/ -update
+        go run make.go -v BareAssets
+        go test -v -p 1 ./vql/uploads/ ./foreman/ ./ingestion/ -update
         cp -a ./vql/uploads/fixtures/* ./foreman/fixtures/* ./ingestion/fixtures/* artifact_output/
 
     - uses: actions/upload-artifact@master
       if: ${{ failure() }}
       with:
-        name: artifact
+        name: regenerated-fixtures-diff-before-committing
         path: artifact_output
