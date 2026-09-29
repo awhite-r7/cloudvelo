@@ -83,8 +83,6 @@ func (self *DatastoreTest) TestDownloadQueriesOnTransientIndex() {
 }
 func TestDataStore(t *testing.T) {
 	suite.Run(t, &DatastoreTest{
-		CloudTestSuite: &testsuite.CloudTestSuite{
-			Indexes: []string{"transient"},
-		},
+		CloudTestSuite: &testsuite.CloudTestSuite{},
 	})
 }

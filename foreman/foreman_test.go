@@ -854,9 +854,7 @@ func (self *ForemanTestSuite) checkAssignedHunts(clientId string, expectedHunts 
 
 func TestForeman(t *testing.T) {
 	suite.Run(t, &ForemanTestSuite{
-		CloudTestSuite: &testsuite.CloudTestSuite{
-			Indexes: []string{"persisted"},
-		},
+		CloudTestSuite: &testsuite.CloudTestSuite{},
 	})
 }
 

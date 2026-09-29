@@ -303,9 +303,7 @@ func (self *IngestionTestSuite) TearDownTest() {
 
 func TestIngestor(t *testing.T) {
 	suite.Run(t, &IngestionTestSuite{
-		CloudTestSuite: &testsuite.CloudTestSuite{
-			Indexes: []string{"transient", "persisted"},
-		},
+		CloudTestSuite: &testsuite.CloudTestSuite{},
 	})
 }
 

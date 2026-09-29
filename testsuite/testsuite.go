@@ -24,8 +24,6 @@ type CloudTestSuite struct {
 	OrgId     string
 	ConfigObj *config.Config
 
-	Indexes []string
-
 	Sm     *services.Service
 	Ctx    context.Context
 	cancel func()
@@ -89,6 +87,13 @@ func (self *CloudTestSuite) TearDownSuite() {
 func (self *CloudTestSuite) TearDownTest() {
 	self.cancel()
 	self.Sm.Close()
+
+	// SetupTest installs a new clock per test, so it has to be restored
+	// per test too - otherwise every test but the last leaks one.
+	if self.time_closer != nil {
+		self.time_closer()
+		self.time_closer = nil
+	}
 }
 
 func (self *CloudTestSuite) SetupTest() {

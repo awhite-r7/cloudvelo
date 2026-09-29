@@ -2,12 +2,14 @@ package launcher_test
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/alecthomas/assert"
 	"github.com/stretchr/testify/suite"
 	"google.golang.org/protobuf/encoding/protojson"
+	cvelo_api "www.velocidex.com/golang/cloudvelo/schema/api"
 	cvelo_services "www.velocidex.com/golang/cloudvelo/services"
 	"www.velocidex.com/golang/cloudvelo/services/client_info"
 	"www.velocidex.com/golang/cloudvelo/testsuite"
@@ -352,6 +354,200 @@ func (self *LauncherTestSuite) warmFlowCache(
 	assert.True(self.T(), len(flows.Items) > 0)
 }
 
+// LoadCollectionContext serves flows out of a 5 minute cache, and
+// DeleteFlow's own GetFlowDetails call populates that cache before the
+// documents are removed. Delete-then-read is the GUI's own flow.
+func (self *LauncherTestSuite) TestDeleteFlowPurgesFlowCache() {
+	config_obj := self.ConfigObj.VeloConf()
+	client_id := "C.1234delete"
+	set_flow_id := "F.todelete"
+
+	launcher, err := services.GetLauncher(config_obj)
+	assert.NoError(self.T(), err)
+
+	closer := utils.SetFlowIdForTests(set_flow_id)
+	defer closer()
+
+	repository := self.loadTestArtifact(config_obj)
+	self.seedClient(config_obj, client_id)
+
+	flow_id, err := launcher.ScheduleArtifactCollection(
+		self.Ctx, config_obj, acl_managers.NullACLManager{},
+		repository, &flows_proto.ArtifactCollectorArgs{
+			ClientId:  client_id,
+			Artifacts: []string{"TestArtifact"},
+		}, nil)
+	assert.NoError(self.T(), err)
+
+	err = cvelo_services.FlushBulkIndexer()
+	assert.NoError(self.T(), err)
+
+	// Read the flow before deleting it, which is what puts it in the
+	// cache.
+	vtesting.WaitUntil(5*time.Second, self.T(), func() bool {
+		details, err := launcher.GetFlowDetails(self.Ctx, config_obj,
+			services.GetFlowOptions{}, client_id, flow_id)
+		return err == nil && details.Context != nil &&
+			details.Context.SessionId == flow_id
+	})
+
+	responses, err := launcher.Storage().DeleteFlow(self.Ctx, config_obj,
+		client_id, flow_id, "admin",
+		services.DeleteFlowOptions{ReallyDoIt: true})
+	assert.NoError(self.T(), err)
+
+	// A per-index failure is reported in the response rather than
+	// returned, so a silently failed delete would otherwise look clean.
+	for _, response := range responses {
+		assert.Equal(self.T(), "", response.Error)
+	}
+
+	// DeleteByQuery refreshes the index, so the delete is already
+	// visible. A retry loop here would hide a cache that is never
+	// purged, because every miss repopulates it.
+	_, err = launcher.GetFlowDetails(self.Ctx, config_obj,
+		services.GetFlowOptions{}, client_id, flow_id)
+	assert.Error(self.T(), err)
+	assert.True(self.T(), utils.IsNotFound(err))
+}
+
+// buildIndex reads Artifacts off flow.Request, falling back to
+// ArtifactsWithResults when the flow has no Request. Flows written by the
+// ingestion path do not always carry one.
+func (self *LauncherTestSuite) TestBuildIndexHandlesFlowWithoutRequest() {
+	config_obj := self.ConfigObj.VeloConf()
+	client_id := "C.1234norequest"
+	flow_id := "F.norequest"
+
+	launcher, err := services.GetLauncher(config_obj)
+	assert.NoError(self.T(), err)
+
+	self.seedClient(config_obj, client_id)
+	self.seedCollectionRecord(config_obj, &flows_proto.ArtifactCollectorContext{
+		ClientId:             client_id,
+		SessionId:            flow_id,
+		ArtifactsWithResults: []string{"Custom.WithResults"},
+		State:                flows_proto.ArtifactCollectorContext_FINISHED,
+	})
+
+	flows, total, err := launcher.Storage().ListFlows(self.Ctx, config_obj,
+		client_id, result_sets.ResultSetOptions{}, 0, 100)
+	assert.NoError(self.T(), err)
+
+	assert.Equal(self.T(), int64(1), total)
+	assert.Equal(self.T(), 1, len(flows))
+	assert.Equal(self.T(), flow_id, flows[0].FlowId)
+
+	// The Request is nil, so the artifact names have to come from
+	// ArtifactsWithResults rather than being dropped.
+	assert.Equal(self.T(), []string{"Custom.WithResults"}, flows[0].Artifacts)
+	assert.Equal(self.T(), "", flows[0].Creator)
+}
+
+// buildIndex pages through the collections with QueryChan sorted on
+// timestamp, and QueryChan abandons the remaining pages when the last row
+// of a page has no value for the sort field. What stops that from
+// truncating the flow index is the transient index being a data stream,
+// which refuses a document without a timestamp outright. Pin that, because
+// turning transient back into a plain index would reintroduce the hazard
+// silently.
+func (self *LauncherTestSuite) TestTransientIndexRejectsRecordWithoutTimestamp() {
+	config_obj := self.ConfigObj.VeloConf()
+	client_id := "C.1234notimestamp"
+
+	launcher, err := services.GetLauncher(config_obj)
+	assert.NoError(self.T(), err)
+
+	self.seedClient(config_obj, client_id)
+
+	for _, flow_id := range []string{"F.good1", "F.good2"} {
+		self.seedCollectionRecord(config_obj,
+			&flows_proto.ArtifactCollectorContext{
+				ClientId:  client_id,
+				SessionId: flow_id,
+				Request: &flows_proto.ArtifactCollectorArgs{
+					Artifacts: []string{"TestArtifact"},
+					Creator:   "admin",
+				},
+				State: flows_proto.ArtifactCollectorContext_FINISHED,
+			})
+	}
+
+	err = self.writeCollectionRecordWithoutTimestamp(config_obj,
+		&flows_proto.ArtifactCollectorContext{
+			ClientId:  client_id,
+			SessionId: "F.notimestamp",
+			Request: &flows_proto.ArtifactCollectorArgs{
+				Artifacts: []string{"TestArtifact"},
+				Creator:   "admin",
+			},
+			State: flows_proto.ArtifactCollectorContext_FINISHED,
+		})
+	assert.Error(self.T(), err)
+	assert.True(self.T(), strings.Contains(err.Error(), "timestamp"))
+
+	// The well formed flows are unaffected.
+	flows, total, err := launcher.Storage().ListFlows(self.Ctx, config_obj,
+		client_id, result_sets.ResultSetOptions{}, 0, 100)
+	assert.NoError(self.T(), err)
+
+	assert.Equal(self.T(), int64(2), total)
+	assert.Equal(self.T(), 2, len(flows))
+
+	seen := make(map[string]bool)
+	for _, flow := range flows {
+		seen[flow.FlowId] = true
+	}
+	assert.True(self.T(), seen["F.good1"])
+	assert.True(self.T(), seen["F.good2"])
+}
+
+// Mirrors FlowStorageManager.WriteFlow.
+func (self *LauncherTestSuite) seedCollectionRecord(
+	config_obj *config_proto.Config,
+	flow *flows_proto.ArtifactCollectorContext) {
+
+	doc_id := cvelo_api.GetDocumentIdForCollection(
+		flow.ClientId, flow.SessionId, "")
+
+	record := cvelo_api.ArtifactCollectorRecordFromProto(flow, doc_id)
+	record.Type = "main"
+	record.Timestamp = utils.GetTime().Now().UnixNano()
+
+	err := cvelo_services.SetElasticIndex(self.Ctx, config_obj.OrgId,
+		"transient", cvelo_services.DocIdRandom, record)
+	assert.NoError(self.T(), err)
+}
+
+// api.ArtifactCollectorRecord has no omitempty on Timestamp, so it cannot
+// express a document that lacks the field at all.
+type collectionRecordWithoutTimestamp struct {
+	ClientId  string `json:"client_id"`
+	SessionId string `json:"session_id"`
+	Raw       string `json:"context,omitempty"`
+	Type      string `json:"type"`
+	Doc_Type  string `json:"doc_type"`
+	ID        string `json:"id"`
+}
+
+func (self *LauncherTestSuite) writeCollectionRecordWithoutTimestamp(
+	config_obj *config_proto.Config,
+	flow *flows_proto.ArtifactCollectorContext) error {
+
+	record := &collectionRecordWithoutTimestamp{
+		ClientId:  flow.ClientId,
+		SessionId: flow.SessionId,
+		Raw:       json.MustMarshalString(flow),
+		Type:      "main",
+		Doc_Type:  "collection",
+		ID: cvelo_api.GetDocumentIdForCollection(
+			flow.ClientId, flow.SessionId, ""),
+	}
+
+	return cvelo_services.SetElasticIndex(self.Ctx, config_obj.OrgId,
+		"transient", cvelo_services.DocIdRandom, record)
+}
+
 func (self *LauncherTestSuite) loadTestArtifact(
 	config_obj *config_proto.Config) services.Repository {
 
@@ -384,9 +580,7 @@ func (self *LauncherTestSuite) seedClient(
 
 func TestLauncher(t *testing.T) {
 	suite.Run(t, &LauncherTestSuite{
-		CloudTestSuite: &testsuite.CloudTestSuite{
-			Indexes: []string{"persisted", "transient"},
-		},
+		CloudTestSuite: &testsuite.CloudTestSuite{},
 	})
 }
 
