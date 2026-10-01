@@ -278,20 +278,28 @@ func (self *FlowStorageManager) LoadCollectionContext(
 		// Try to get it again from the cache. Should be there this
 		// time.
 		flows_any, err = self.cache.Get(client_id)
-
-	} else {
-		cvelo_services.Count("LoadCollectionContext (Cached)")
 	}
 
 	flows, ok := flows_any.(*FlowCacheItem)
 	if ok {
-		hit, ok := flows.Get(flow_id)
-		if ok {
+		hit, pres := flows.Get(flow_id)
+
+		// The snapshot is per process with no cross process invalidation,
+		// so a non terminal entry may already be superseded.
+		if pres && isTerminalFlowState(hit.State) {
+			cvelo_services.Count("LoadCollectionContext (Cached)")
 			return hit, nil
 		}
 	}
 
 	return self.LoadCollectionContextSlow(ctx, config_obj, client_id, flow_id)
+}
+
+// FINISHED and ERROR are the only states a collection does not leave.
+func isTerminalFlowState(
+	state flows_proto.ArtifactCollectorContext_State) bool {
+	return state == flows_proto.ArtifactCollectorContext_FINISHED ||
+		state == flows_proto.ArtifactCollectorContext_ERROR
 }
 
 // The old slow version of LoadCollectionContext.
