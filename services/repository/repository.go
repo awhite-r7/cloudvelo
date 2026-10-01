@@ -35,6 +35,10 @@ type Repository struct {
 
 	parent            services.Repository
 	parent_config_obj *config_proto.Config
+
+	// Cached artifact metadata for this org (see metadata.go).
+	metadata        map[string]*artifacts_proto.ArtifactMetadata
+	metadata_expiry time.Time
 }
 
 const (
@@ -141,24 +145,25 @@ func (self *Repository) List(
 
 }
 
-// This repository is stateless so it keeps no tag metadata of its own.
-// Built in artifacts (which carry the tags) are held by the parent
-// repository, so delegate there when we have one. We deliberately do not
-// propagate an error because the only caller fails the entire
-// ListAvailableArtifacts request on error, which would break artifact
-// listing in the GUI.
+// Returns all tags set on artifacts in this org merged with the
+// parent's. We deliberately do not propagate a parent error (the in
+// memory built in repository has no metadata and returns NotFound)
+// because the only caller fails the entire ListAvailableArtifacts
+// request on error, which would break artifact listing in the GUI.
 func (self *Repository) Tags(
 	ctx context.Context,
 	config_obj *config_proto.Config) ([]string, error) {
 
+	tags := self.localTags(ctx)
+
 	if self.parent != nil {
-		tags, err := self.parent.Tags(ctx, self.parent_config_obj)
+		parent_tags, err := self.parent.Tags(ctx, self.parent_config_obj)
 		if err == nil {
-			return tags, nil
+			tags = append(tags, parent_tags...)
 		}
 	}
 
-	return nil, nil
+	return uniqueSorted(tags), nil
 }
 
 func (self *Repository) Copy() services.Repository {
@@ -206,9 +211,20 @@ func (self *Repository) Del(name string) {
 	self.lru.Remove(name)
 	cvelo_services.DeleteDocument(self.ctx, self.config_obj.OrgId,
 		"persisted", name, cvelo_services.SyncDelete)
+	_ = self.SetMetadata(self.ctx, name, nil)
 }
 
 func (self *Repository) Get(
+	ctx context.Context, config_obj *config_proto.Config,
+	name string) (*artifacts_proto.Artifact, bool) {
+	artifact, pres := self.get(ctx, config_obj, name)
+	if !pres {
+		return nil, false
+	}
+	return self.decorateMetadata(ctx, artifact), true
+}
+
+func (self *Repository) get(
 	ctx context.Context, config_obj *config_proto.Config,
 	name string) (*artifacts_proto.Artifact, bool) {
 	// Strip off any source specification
