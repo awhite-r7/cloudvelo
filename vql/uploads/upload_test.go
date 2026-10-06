@@ -393,8 +393,11 @@ func (self *UploaderTestSuite) checkForKey(filter string) []string {
 	assert.NoError(self.T(), err)
 
 	svc := s3.New(session)
+	// Only list this org's objects, the bucket is shared by all
+	// test packages.
 	res, err := svc.ListObjects(&s3.ListObjectsInput{
 		Bucket: &self.ConfigObj.Cloud.Bucket,
+		Prefix: aws.String("orgs/" + self.OrgId + "/"),
 	})
 	assert.NoError(self.T(), err)
 
@@ -410,9 +413,7 @@ func (self *UploaderTestSuite) checkForKey(filter string) []string {
 
 func TestUploader(t *testing.T) {
 	suite.Run(t, &UploaderTestSuite{
-		CloudTestSuite: &testsuite.CloudTestSuite{
-			OrgId: "test",
-		},
-		golden: ordereddict.NewDict(),
+		CloudTestSuite: &testsuite.CloudTestSuite{},
+		golden:         ordereddict.NewDict(),
 	})
 }

@@ -96,7 +96,7 @@ func (self *IngestionTestSuite) ingestGoldenMessages(
 		err = json.Unmarshal(data, message)
 		assert.NoError(self.T(), err)
 
-		message.OrgId = "test"
+		message.OrgId = self.ConfigObj.OrgId
 
 		err = ingestor.Process(ctx, message)
 		assert.NoError(self.T(), err)
@@ -113,7 +113,8 @@ func (self *IngestionTestSuite) TestEnrollment() {
 	client_id := "C.1352adc54e292a23"
 
 	record, err := cvelo_services.GetElasticRecord(self.ctx,
-		"test", "persisted", client_id+"-test_key")
+		self.ConfigObj.OrgId, "persisted",
+		utils.ClientIdFromConfigObj(client_id, self.ConfigObj.VeloConf())+"_key")
 	assert.NoError(self.T(), err)
 	self.golden.Set("Enrollment", record)
 
@@ -129,7 +130,7 @@ func (self *IngestionTestSuite) TestEnrollment() {
 
 	// Record results in monitoring data.
 	records, _, err := cvelo_services.QueryElasticRaw(self.ctx,
-		"test", "transient", getAllItemsQuery)
+		self.ConfigObj.OrgId, "transient", getAllItemsQuery)
 	assert.NoError(self.T(), err)
 	assert.Equal(self.T(), 1, len(records))
 
@@ -147,7 +148,7 @@ func (self *IngestionTestSuite) TestListDirectory() {
 
 	// Test VFS.ListDirectory special handling.
 	err := cvelo_services.SetElasticIndex(self.ctx,
-		"test", "transient", flow_id, api.ArtifactCollectorRecordFromProto(
+		self.ConfigObj.OrgId, "transient", flow_id, api.ArtifactCollectorRecordFromProto(
 			&flows_proto.ArtifactCollectorContext{
 				ClientId:   client_id,
 				SessionId:  flow_id,
@@ -156,13 +157,13 @@ func (self *IngestionTestSuite) TestListDirectory() {
 
 	self.ingestGoldenMessages(self.ctx, self.ingestor, "System.VFS.ListDirectory")
 	records, _, err := cvelo_services.QueryElasticRaw(self.ctx,
-		"test", "transient",
+		self.ConfigObj.OrgId, "transient",
 		json.Format(getCollectionQuery, client_id, flow_id, "collection"))
 	assert.NoError(self.T(), err)
 	self.golden.Set("System.VFS.ListDirectory", records)
 
 	records, _, err = cvelo_services.QueryElasticRaw(self.ctx,
-		"test", "transient", getAllItemsQuery)
+		self.ConfigObj.OrgId, "transient", getAllItemsQuery)
 	assert.NoError(self.T(), err)
 	sort_records(records)
 	self.golden.Set("System.VFS.ListDirectory Results", records)
@@ -171,7 +172,7 @@ func (self *IngestionTestSuite) TestListDirectory() {
 	// no downloads yet but a full directory listing.
 	query := getAllItemsQueryForType
 	records, _, err = cvelo_services.QueryElasticRaw(self.ctx,
-		"test", "transient", query)
+		self.ConfigObj.OrgId, "transient", query)
 	assert.NoError(self.T(), err)
 	sort_records(records)
 	self.golden.Set("System.VFS.ListDirectory vfs", records)
@@ -202,7 +203,7 @@ func (self *IngestionTestSuite) TestVFSDownload() {
 	list_flow_id := "F.CEV6I8LHAT83O"
 
 	// Add a VFS.DownloadFile collection and replay messages.
-	err := cvelo_services.SetElasticIndex(self.ctx, "test",
+	err := cvelo_services.SetElasticIndex(self.ctx, self.ConfigObj.OrgId,
 		"transient", "", api.ArtifactCollectorRecordFromProto(
 			&flows_proto.ArtifactCollectorContext{
 				ClientId:   client_id,
@@ -219,7 +220,7 @@ func (self *IngestionTestSuite) TestVFSDownload() {
 
 	// Test VFS.ListDirectory special handling.
 	err = cvelo_services.SetElasticIndex(self.ctx,
-		"test", "transient", "",
+		self.ConfigObj.OrgId, "transient", "",
 		api.ArtifactCollectorRecordFromProto(
 			&flows_proto.ArtifactCollectorContext{
 				ClientId:   client_id,
@@ -256,12 +257,12 @@ func (self *IngestionTestSuite) TestClientEventMonitoring() {
 	// Get Client Event Monitoring Clear the results so we get a clean
 	// golden image.
 	err := cvelo_services.DeleteByQuery(
-		self.ctx, "test", "transient", getAllItemsQuery)
+		self.ctx, self.ConfigObj.OrgId, "transient", getAllItemsQuery)
 	assert.NoError(self.T(), err)
 
 	self.ingestGoldenMessages(self.ctx, self.ingestor, "Generic.Client.Stats")
 	records, _, err := cvelo_services.QueryElasticRaw(self.ctx,
-		"test", "transient", getAllItemsQuery)
+		self.ConfigObj.OrgId, "transient", getAllItemsQuery)
 	assert.NoError(self.T(), err)
 	sort_records(records)
 	self.golden.Set("Generic.Client.Stats Results", records)
