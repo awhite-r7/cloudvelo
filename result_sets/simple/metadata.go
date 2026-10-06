@@ -85,7 +85,16 @@ func SetResultSetMetadata(
 	config_obj *config_proto.Config,
 	log_path api.FSPathSpec, md *ResultSetMetadataRecord) error {
 
-	md.Timestamp = utils.GetTime().Now().UnixNano()
+	// Readers use the record with the newest timestamp, so each
+	// record must be newer than the one it replaces. The clock alone
+	// does not guarantee this: it may be frozen in tests, and appends
+	// can come from a frontend whose clock is behind the last writer.
+	now := utils.GetTime().Now().UnixNano()
+	if now <= md.Timestamp {
+		now = md.Timestamp + 1
+	}
+	md.Timestamp = now
+
 	return setElasticIndex(ctx, utils.GetOrgId(config_obj),
 		"transient", services.DocIdRandom, md)
 }

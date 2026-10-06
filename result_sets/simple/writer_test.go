@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/Velocidex/ordereddict"
 	"github.com/stretchr/testify/assert"
@@ -13,6 +14,7 @@ import (
 	"www.velocidex.com/golang/velociraptor/file_store/path_specs"
 	"www.velocidex.com/golang/velociraptor/json"
 	"www.velocidex.com/golang/velociraptor/result_sets"
+	"www.velocidex.com/golang/velociraptor/utils"
 )
 
 // fakeElastic records documents written by the writer and can be
@@ -54,16 +56,23 @@ func (self *fakeElastic) lastMD() ResultSetMetadataRecord {
 	return self.md[len(self.md)-1]
 }
 
-// Like GetResultSetMetadata, returns the newest metadata record or an
-// empty legacy record if there is none.
+// Like GetResultSetMetadata, returns the record with the newest
+// timestamp or an empty legacy record if there is none. Elastic does
+// not order records with the same timestamp, so on a tie this returns
+// the older record to make ties show up in tests.
 func (self *fakeElastic) getResultSetMetadata(ctx context.Context,
 	config_obj *config_proto.Config,
 	log_path api.FSPathSpec) (*ResultSetMetadataRecord, error) {
 	if len(self.md) == 0 {
 		return &ResultSetMetadataRecord{Type: "rs_metadata"}, nil
 	}
-	md := self.lastMD()
-	return &md, nil
+	newest := self.md[0]
+	for _, md := range self.md[1:] {
+		if md.Timestamp > newest.Timestamp {
+			newest = md
+		}
+	}
+	return &newest, nil
 }
 
 func installFakeElastic(t *testing.T) *fakeElastic {
@@ -170,7 +179,11 @@ func openTestWriter(t *testing.T, sync bool,
 	mode result_sets.WriteMode, new_id string) *ElasticSimpleResultSetWriter {
 	md, err := openWriterMetadata(context.Background(),
 		&config_proto.Config{}, testLogPath, mode,
-		&ResultSetMetadataRecord{ID: new_id, Type: "rs_metadata"})
+		&ResultSetMetadataRecord{
+			ID:        new_id,
+			Type:      "rs_metadata",
+			Timestamp: utils.GetTime().Now().UnixNano(),
+		})
 	assert.NoError(t, err)
 
 	writer := newTestWriter(sync)
@@ -240,4 +253,73 @@ func TestClientLogRecoversAfterWriteError(t *testing.T) {
 	assert.Equal(t, "v2", fake.rows[1].ID)
 	assert.Equal(t, int64(2), fake.rows[1].StartRow)
 	assert.Equal(t, int64(3), fake.lastMD().EndRow)
+}
+
+// Freezes the clock for the rest of the test.
+func freezeClock(t *testing.T) int64 {
+	now := time.Unix(1661385600, 0)
+	t.Cleanup(utils.MockTime(utils.NewMockClock(now)))
+	return now.UnixNano()
+}
+
+func TestMetadataTimestampsIncreaseWithFrozenClock(t *testing.T) {
+	fake := installFakeElastic(t)
+	freezeClock(t)
+
+	// Each batch is appended by a new writer, as in log ingestion.
+	for i := 0; i < 3; i++ {
+		writer := openTestWriter(t, true, result_sets.AppendMode, "v1")
+		writer.WriteJSONL([]byte("{\"A\":1}\n"), 1)
+		writer.Close()
+	}
+
+	for i := 1; i < len(fake.md); i++ {
+		assert.Greater(t, fake.md[i].Timestamp, fake.md[i-1].Timestamp)
+	}
+
+	md, err := fake.getResultSetMetadata(context.Background(), nil, testLogPath)
+	assert.NoError(t, err)
+	assert.Equal(t, int64(3), md.EndRow)
+}
+
+func TestAppendFromSlowClockReplacesRecord(t *testing.T) {
+	fake := installFakeElastic(t)
+	now := freezeClock(t)
+
+	// The last record came from a frontend whose clock is an hour
+	// ahead of ours.
+	ahead := now + int64(time.Hour)
+	fake.md = []ResultSetMetadataRecord{{ID: "v1", EndRow: 2, Timestamp: ahead}}
+
+	writer := openTestWriter(t, true, result_sets.AppendMode, "v2")
+	writer.WriteJSONL([]byte("{\"A\":3}\n"), 1)
+	writer.Close()
+
+	assert.Greater(t, fake.lastMD().Timestamp, ahead)
+
+	md, err := fake.getResultSetMetadata(context.Background(), nil, testLogPath)
+	assert.NoError(t, err)
+	assert.Equal(t, "v1", md.ID)
+	assert.Equal(t, int64(3), md.EndRow)
+}
+
+func TestRecoveryReplacesAbortedRecordFromFastClock(t *testing.T) {
+	fake := installFakeElastic(t)
+	now := freezeClock(t)
+
+	// The write that failed came from a frontend whose clock is an
+	// hour ahead of ours.
+	ahead := now + int64(time.Hour)
+	fake.md = []ResultSetMetadataRecord{
+		{ID: "v1", EndRow: -1, TotalRows: -1, Timestamp: ahead}}
+
+	writer := openTestWriter(t, true, result_sets.AppendMode, "v2")
+	writer.WriteJSONL([]byte("{\"A\":1}\n"), 1)
+	writer.Close()
+
+	md, err := fake.getResultSetMetadata(context.Background(), nil, testLogPath)
+	assert.NoError(t, err)
+	assert.Equal(t, "v2", md.ID)
+	assert.Equal(t, int64(0), md.TotalRows)
+	assert.Equal(t, int64(1), md.EndRow)
 }
