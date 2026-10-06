@@ -86,6 +86,6 @@ func SetResultSetMetadata(
 	log_path api.FSPathSpec, md *ResultSetMetadataRecord) error {
 
 	md.Timestamp = utils.GetTime().Now().UnixNano()
-	return cvelo_services.SetElasticIndex(ctx, utils.GetOrgId(config_obj),
+	return setElasticIndex(ctx, utils.GetOrgId(config_obj),
 		"transient", services.DocIdRandom, md)
 }
