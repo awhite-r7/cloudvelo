@@ -286,7 +286,7 @@ func (self *FlowStorageManager) LoadCollectionContext(
 
 		// The snapshot is per process with no cross process invalidation,
 		// so a non terminal entry may already be superseded.
-		if pres && isTerminalFlowState(hit.State) {
+		if pres && hit != nil && isTerminalFlowState(hit.State) {
 			cvelo_services.Count("LoadCollectionContext (Cached)")
 			return hit, nil
 		}
