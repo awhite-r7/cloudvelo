@@ -91,11 +91,19 @@ func openWriterMetadata(
 	if !truncate {
 		existing_md, err := getResultSetMetadata(ctx, config_obj, log_path)
 
-		// An aborted result set can never be read again, so appending
-		// to it would make the new rows unreadable too. Start a new
-		// version instead so the result set recovers.
-		if err == nil && existing_md.TotalRows >= 0 {
-			return existing_md, nil
+		if err == nil {
+			// An aborted result set can never be read again, so
+			// appending to it would make the new rows unreadable
+			// too. Start a new version instead so the result set
+			// recovers.
+			if existing_md.TotalRows >= 0 {
+				return existing_md, nil
+			}
+
+			// The new version has to replace the aborted record.
+			if new_md.Timestamp < existing_md.Timestamp {
+				new_md.Timestamp = existing_md.Timestamp
+			}
 		}
 	}
 
