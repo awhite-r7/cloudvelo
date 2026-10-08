@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Velocidex/ordereddict"
 	"github.com/alecthomas/assert"
 	"github.com/stretchr/testify/suite"
 	"google.golang.org/protobuf/encoding/protojson"
@@ -17,8 +18,10 @@ import (
 	actions_proto "www.velocidex.com/golang/velociraptor/actions/proto"
 	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
 	crypto_proto "www.velocidex.com/golang/velociraptor/crypto/proto"
+	"www.velocidex.com/golang/velociraptor/file_store"
 	flows_proto "www.velocidex.com/golang/velociraptor/flows/proto"
 	"www.velocidex.com/golang/velociraptor/json"
+	"www.velocidex.com/golang/velociraptor/paths"
 	"www.velocidex.com/golang/velociraptor/result_sets"
 	"www.velocidex.com/golang/velociraptor/services"
 	"www.velocidex.com/golang/velociraptor/utils"
@@ -335,6 +338,46 @@ func (self *LauncherTestSuite) TestLoadCollectionContextServesTerminalFlowFromSn
 		self.Ctx, config_obj, client_id, flow_id)
 	assert.NoError(self.T(), err)
 	assert.True(self.T(), first == second)
+}
+
+// A flow index written by an older build has no _Flow column, so its
+// rows load with a nil context. Such an entry must fall back to the
+// datastore rather than be dereferenced.
+func (self *LauncherTestSuite) TestLoadCollectionContextIgnoresIndexRowWithoutFlow() {
+	config_obj := self.ConfigObj.VeloConf()
+	client_id := "C.legacyindex"
+	flow_id := "F.legacyrow"
+
+	self.seedClient(config_obj, client_id)
+	self.seedCollectionRecord(config_obj, completedFlow(client_id, flow_id))
+	self.writeFlowIndexWithoutFlow(config_obj, client_id, flow_id)
+
+	instance := self.newLauncherInstance()
+
+	collection_context, err := instance.Storage().LoadCollectionContext(
+		self.Ctx, config_obj, client_id, flow_id)
+	assert.NoError(self.T(), err)
+	assert.Equal(self.T(),
+		flows_proto.ArtifactCollectorContext_FINISHED, collection_context.State)
+}
+
+// Writes the index row shape an older build produces. The index is
+// fresh, so it is read as is rather than rebuilt.
+func (self *LauncherTestSuite) writeFlowIndexWithoutFlow(
+	config_obj *config_proto.Config, client_id, flow_id string) {
+
+	rs_writer, err := result_sets.NewResultSetWriter(
+		file_store.GetFileStore(config_obj),
+		paths.NewClientPathManager(client_id).FlowIndex(),
+		json.DefaultEncOpts(), utils.SyncCompleter, result_sets.TruncateMode)
+	assert.NoError(self.T(), err)
+
+	rs_writer.Write(ordereddict.NewDict().
+		Set("FlowId", flow_id).
+		Set("Artifacts", []string{"TestArtifact"}).
+		Set("Created", 0).
+		Set("Creator", "admin"))
+	rs_writer.Close()
 }
 
 func (self *LauncherTestSuite) newLauncherInstance() services.Launcher {
