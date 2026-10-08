@@ -30,7 +30,7 @@ func (self *fakeElastic) setElasticIndex(ctx context.Context,
 	org_id, index, id string, record interface{}) error {
 	switch t := record.(type) {
 	case *ResultSetMetadataRecord:
-		self.md = append(self.md, *t)
+		self.md = append(self.md, copyMetadata(*t))
 	case *SimpleResultSetRecord:
 		self.rs_calls++
 		if self.rs_calls > 100 {
@@ -72,7 +72,18 @@ func (self *fakeElastic) getResultSetMetadata(ctx context.Context,
 			newest = md
 		}
 	}
+	newest = copyMetadata(newest)
 	return &newest, nil
+}
+
+// Elastic stores and returns serialized copies, so changes to a
+// writer's record must not change a stored one, or the reverse.
+func copyMetadata(md ResultSetMetadataRecord) ResultSetMetadataRecord {
+	if md.EndByte != nil {
+		end_byte := *md.EndByte
+		md.EndByte = &end_byte
+	}
+	return md
 }
 
 func installFakeElastic(t *testing.T) *fakeElastic {
@@ -179,11 +190,7 @@ func openTestWriter(t *testing.T, sync bool,
 	mode result_sets.WriteMode, new_id string) *ElasticSimpleResultSetWriter {
 	md, err := openWriterMetadata(context.Background(),
 		&config_proto.Config{}, testLogPath, mode,
-		&ResultSetMetadataRecord{
-			ID:        new_id,
-			Type:      "rs_metadata",
-			Timestamp: utils.GetTime().Now().UnixNano(),
-		})
+		newWriterMetadata(testLogPath, new_id))
 	assert.NoError(t, err)
 
 	writer := newTestWriter(sync)
@@ -322,4 +329,169 @@ func TestRecoveryReplacesAbortedRecordFromFastClock(t *testing.T) {
 	assert.Equal(t, "v2", md.ID)
 	assert.Equal(t, int64(0), md.TotalRows)
 	assert.Equal(t, int64(1), md.EndRow)
+}
+
+// Compresses JSONL the way a client does for a compressed response.
+func compressed(t *testing.T, jsonl string) []byte {
+	data, err := utils.Compress([]byte(jsonl))
+	assert.NoError(t, err)
+	return data
+}
+
+const (
+	batch1 = "{\"A\":1}\n{\"A\":2}\n"
+	batch2 = "{\"A\":3}\n"
+)
+
+func TestCompressedJSONLWritesRowsInSequence(t *testing.T) {
+	fake := installFakeElastic(t)
+
+	writer := openTestWriter(t, true, result_sets.AppendMode, "v1")
+	writer.WriteCompressedJSONL(compressed(t, batch1), 0, len(batch1), 2)
+	writer.WriteCompressedJSONL(compressed(t, batch2), uint64(len(batch1)), len(batch2), 1)
+	writer.Close()
+
+	assert.Equal(t, 1, len(fake.rows))
+	assert.Equal(t, batch1+batch2, fake.rows[0].JSONData)
+	assert.Equal(t, int64(3), fake.rows[0].EndRow)
+
+	md := fake.lastMD()
+	assert.Equal(t, int64(3), md.EndRow)
+	assert.Equal(t, int64(0), md.TotalRows)
+	assert.Equal(t, int64(len(batch1+batch2)), *md.EndByte)
+}
+
+func TestCompressedJSONLOffsetContinuesAcrossWriters(t *testing.T) {
+	fake := installFakeElastic(t)
+	fake.md = []ResultSetMetadataRecord{{ID: "v1", EndByte: new(int64)}}
+
+	// Each client response is written by a new writer, as in
+	// ingestion, and a plain batch counts towards the offset too.
+	writer := openTestWriter(t, true, result_sets.AppendMode, "v2")
+	writer.WriteJSONL([]byte(batch1), 2)
+	writer.Close()
+
+	writer = openTestWriter(t, true, result_sets.AppendMode, "v3")
+	writer.WriteCompressedJSONL(compressed(t, batch2), uint64(len(batch1)), len(batch2), 1)
+	writer.Close()
+
+	assert.Equal(t, 2, len(fake.rows))
+	md := fake.lastMD()
+	assert.Equal(t, "v1", md.ID)
+	assert.Equal(t, int64(3), md.EndRow)
+	assert.Equal(t, int64(0), md.TotalRows)
+	assert.Equal(t, int64(len(batch1+batch2)), *md.EndByte)
+
+	// A later writer is checked against the stored position.
+	writer = openTestWriter(t, true, result_sets.AppendMode, "v4")
+	writer.WriteCompressedJSONL(compressed(t, batch2), uint64(len(batch1)), len(batch2), 1)
+	writer.Close()
+
+	assert.Equal(t, 2, len(fake.rows))
+	assert.Equal(t, int64(-1), fake.lastMD().TotalRows)
+}
+
+func TestCompressedJSONLCorruptDataAborts(t *testing.T) {
+	fake := installFakeElastic(t)
+
+	writer := openTestWriter(t, true, result_sets.AppendMode, "v1")
+	writer.WriteCompressedJSONL([]byte("not zlib"), 0, len(batch1), 2)
+
+	// Nothing more is written once aborted.
+	writer.WriteCompressedJSONL(compressed(t, batch1), 0, len(batch1), 2)
+	writer.Close()
+
+	assert.Equal(t, 0, len(fake.rows))
+	assert.Equal(t, int64(-1), fake.lastMD().TotalRows)
+}
+
+func TestCompressedJSONLLengthMismatchAborts(t *testing.T) {
+	fake := installFakeElastic(t)
+
+	writer := openTestWriter(t, true, result_sets.AppendMode, "v1")
+	writer.WriteCompressedJSONL(compressed(t, batch1), 0, len(batch1)+1, 2)
+	writer.Close()
+
+	assert.Equal(t, 0, len(fake.rows))
+	assert.Equal(t, int64(-1), fake.lastMD().TotalRows)
+}
+
+func TestCompressedJSONLOutOfSequenceOffsetAborts(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		offset uint64
+	}{
+		{"repeated batch", 0},
+		{"gap", uint64(len(batch1)) + 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fake := installFakeElastic(t)
+
+			writer := openTestWriter(t, true, result_sets.AppendMode, "v1")
+			writer.WriteCompressedJSONL(compressed(t, batch1), 0, len(batch1), 2)
+			writer.WriteCompressedJSONL(compressed(t, batch2), tc.offset, len(batch2), 1)
+			writer.Close()
+
+			// The first batch was still buffered, so it is discarded
+			// with the rest of the result set.
+			assert.Equal(t, 0, len(fake.rows))
+			assert.Equal(t, int64(-1), fake.lastMD().TotalRows)
+		})
+	}
+}
+
+func TestCompressedJSONLStartsCheckingFromUnknownPosition(t *testing.T) {
+	fake := installFakeElastic(t)
+
+	// Records written before the byte position was tracked do not
+	// have it, so the first batch's offset is taken as the position.
+	fake.md = []ResultSetMetadataRecord{{ID: "v1", EndRow: 2}}
+
+	writer := openTestWriter(t, true, result_sets.AppendMode, "v2")
+	writer.WriteCompressedJSONL(compressed(t, batch2), 12345, len(batch2), 1)
+	writer.Close()
+
+	assert.Equal(t, 1, len(fake.rows))
+	md := fake.lastMD()
+	assert.Equal(t, int64(3), md.EndRow)
+	assert.Equal(t, int64(0), md.TotalRows)
+	assert.Equal(t, int64(12345+len(batch2)), *md.EndByte)
+
+	// The next batch is checked against it.
+	writer = openTestWriter(t, true, result_sets.AppendMode, "v3")
+	writer.WriteCompressedJSONL(compressed(t, batch2), 12345, len(batch2), 1)
+	writer.Close()
+
+	assert.Equal(t, 1, len(fake.rows))
+	assert.Equal(t, int64(-1), fake.lastMD().TotalRows)
+}
+
+func TestCompressedJSONLContinuesAfterRecovery(t *testing.T) {
+	fake := installFakeElastic(t)
+
+	// The client has already sent batch1 when a write fails and the
+	// result set is aborted.
+	fake.md = []ResultSetMetadataRecord{{ID: "v1", EndRow: 2,
+		EndByte: new(int64)}}
+	*fake.md[0].EndByte = int64(len(batch1))
+
+	fake.fail_rs = true
+	writer := openTestWriter(t, true, result_sets.AppendMode, "v2")
+	writer.WriteCompressedJSONL(compressed(t, batch2), uint64(len(batch1)), len(batch2), 1)
+	writer.Close()
+	assert.Equal(t, int64(-1), fake.lastMD().TotalRows)
+
+	// The new version does not know the client's position, so the
+	// client's next batch is accepted rather than aborting again.
+	fake.fail_rs = false
+	offset := uint64(len(batch1 + batch2))
+	writer = openTestWriter(t, true, result_sets.AppendMode, "v3")
+	writer.WriteCompressedJSONL(compressed(t, batch2), offset, len(batch2), 1)
+	writer.Close()
+
+	md := fake.lastMD()
+	assert.Equal(t, "v3", md.ID)
+	assert.Equal(t, int64(1), md.EndRow)
+	assert.Equal(t, int64(0), md.TotalRows)
+	assert.Equal(t, int64(offset)+int64(len(batch2)), *md.EndByte)
 }
