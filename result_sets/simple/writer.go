@@ -10,6 +10,7 @@ import (
 	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
 	"www.velocidex.com/golang/velociraptor/file_store/api"
 	"www.velocidex.com/golang/velociraptor/json"
+	"www.velocidex.com/golang/velociraptor/logging"
 	"www.velocidex.com/golang/velociraptor/utils"
 )
 
@@ -119,24 +120,72 @@ func (self *ElasticSimpleResultSetWriter) writeJSONL(
 
 	self.start_row = record.EndRow
 	self.md.EndRow = record.EndRow
+	if self.md.EndByte != nil {
+		*self.md.EndByte += int64(len(serialized))
+	}
 
 	return nil
 }
 
 // The Elastic backend stores plain JSONL rows so there is nowhere to keep
 // a compressed blob and its chunk index. Inflate the batch and store it as
-// normal rows rather than dropping it. Like the upstream implementation the
-// interface gives us no way to report an error.
+// normal rows rather than dropping it. The interface gives us no way to
+// report an error, so a batch that is corrupt or out of sequence aborts
+// the result set rather than storing rows in the wrong place.
 func (self *ElasticSimpleResultSetWriter) WriteCompressedJSONL(
 	serialized []byte, byte_offset uint64,
 	uncompressed_size int, total_rows uint64) {
+	if self.aborted {
+		return
+	}
 
 	uncompressed, err := utils.Uncompress(self.ctx, serialized)
 	if err != nil {
+		self.abortWithError("can not decompress batch: %v", err)
+		return
+	}
+
+	if len(uncompressed) != uncompressed_size {
+		self.abortWithError(
+			"batch decompressed to %v bytes, expected %v",
+			len(uncompressed), uncompressed_size)
+		return
+	}
+
+	next_byte, known := self.nextByte()
+	if !known {
+		// New result sets and ones written before the byte position
+		// was tracked do not record it. Start from this batch's
+		// offset so the batches after it are checked.
+		if len(self.buff) == 0 {
+			start := int64(byte_offset)
+			self.md.EndByte = &start
+		}
+
+	} else if byte_offset != uint64(next_byte) {
+		self.abortWithError("batch starts at byte %v, expected %v",
+			byte_offset, next_byte)
 		return
 	}
 
 	self.WriteJSONL(uncompressed, total_rows)
+}
+
+// The position in the uncompressed JSONL stream where the next batch
+// starts: the bytes already stored plus the bytes still buffered.
+func (self *ElasticSimpleResultSetWriter) nextByte() (int64, bool) {
+	if self.md.EndByte == nil {
+		return 0, false
+	}
+	return *self.md.EndByte + int64(len(self.buff)), true
+}
+
+func (self *ElasticSimpleResultSetWriter) abortWithError(
+	format string, args ...interface{}) {
+	logger := logging.GetLogger(self.config_obj, &logging.FrontendComponent)
+	logger.Error("Aborting result set %v: "+format,
+		append([]interface{}{self.log_path.AsClientPath()}, args...)...)
+	self.Abort()
 }
 
 func (self *ElasticSimpleResultSetWriter) Write(row *ordereddict.Dict) {

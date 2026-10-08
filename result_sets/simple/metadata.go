@@ -32,6 +32,11 @@ type ResultSetMetadataRecord struct {
 	EndRow    int64  `json:"end_row"`
 	TotalRows int64  `json:"total_rows"`
 	Type      string `json:"type"`
+
+	// Number of uncompressed JSONL bytes stored, which is where the
+	// next compressed batch must start. Nil when the position is not
+	// known, e.g. for records written before it was tracked.
+	EndByte *int64 `json:"end_byte,omitempty"`
 }
 
 // Because we can not delete result sets in the transient index we

@@ -48,17 +48,10 @@ func (self ResultSetFactory) NewResultSetWriter(
 	config_obj := cloud_config_obj.VeloConf()
 
 	new_id := fmt.Sprintf("%v", utils.GetGUID())
-	base_record := NewSimpleResultSetRecord(log_path, new_id)
 	ctx := context.Background()
 
 	md, err := openWriterMetadata(ctx, config_obj, log_path, truncate,
-		&ResultSetMetadataRecord{
-			Timestamp: utils.GetTime().Now().UnixNano(),
-			VFSPath:   base_record.VFSPath,
-			ID:        new_id,
-			EndRow:    0,
-			Type:      "rs_metadata",
-		})
+		newWriterMetadata(log_path, new_id))
 	if err != nil {
 		return nil, err
 	}
@@ -76,6 +69,20 @@ func (self ResultSetFactory) NewResultSetWriter(
 		rows_per_result_set: rows_per_result_set,
 		max_size_per_packet: max_size_per_packet,
 	}, nil
+}
+
+// The metadata record for a new version of a result set. Its byte
+// position is left unknown: after an abort the new version continues
+// a client's stream part way through, so it can not start at 0.
+func newWriterMetadata(
+	log_path api.FSPathSpec, id string) *ResultSetMetadataRecord {
+	return &ResultSetMetadataRecord{
+		Timestamp: utils.GetTime().Now().UnixNano(),
+		VFSPath:   NewSimpleResultSetRecord(log_path, id).VFSPath,
+		ID:        id,
+		EndRow:    0,
+		Type:      "rs_metadata",
+	}
 }
 
 // Returns the metadata record a new writer continues from. When
