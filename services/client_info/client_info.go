@@ -103,9 +103,7 @@ func (self *ClientInfoBase) Set(
 	cvelo_services.Count("SetClient")
 
 	// An empty client id would index a main record under a random
-	// document id. Validate through the org's client info manager
-	// rather than our own ValidateClientId so a wrapping manager (like
-	// r7raptor's) can accept its own client id format.
+	// document id. Validate through the org's client info manager.
 	client_info_manager, err := services.GetClientInfoManager(self.config_obj)
 	if err != nil {
 		return err
